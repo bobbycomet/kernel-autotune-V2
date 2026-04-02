@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/bobbycomet/kernel-autotune-V2/blob/main/kernelautotune.png?raw=true" width="50%">
+</p>
+
 # Kernel Autotune v2 is an intelligent system tuning utility designed to optimize Linux kernel parameters based on your specific hardware and running kernel. It provides predictable performance improvements by automatically detecting hardware and applying a tailored profile.
 
 ## Key Features
