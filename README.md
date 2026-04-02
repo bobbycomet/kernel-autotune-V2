@@ -1,6 +1,8 @@
 # Kernel Autotune v2 is an intelligent system tuning utility designed to optimize Linux kernel parameters based on your specific hardware and running kernel. It provides predictable performance improvements by automatically detecting hardware and applying a tailored profile.
 
-- Key FeaturesIntelligent Kernel Detection: Automatically identifies and tunes for XanMod, Liquorix, Zen, TKG, CK, Clear, and CachyOS kernels.Hardware Awareness: Detects if the system is a desktop, laptop, or handheld (like a Steam Deck or ROG Ally) to adjust power and performance balance. 
+## Key Features
+
+- Intelligent Kernel Detection: Automatically identifies and tunes for XanMod, Liquorix, Zen, TKG, CK, Clear, and CachyOS kernels.Hardware Awareness: Detects if the system is a desktop, laptop, or handheld (like a Steam Deck or ROG Ally) to adjust power and performance balance. 
 
 - Memory Management: Configures ZRAM and Zswap based on total RAM capacity.
 
