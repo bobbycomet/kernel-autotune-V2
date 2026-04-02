@@ -1,300 +1,56 @@
-# xanmod-autotuner
+# Kernel Autotune v2 is an intelligent system tuning utility designed to optimize Linux kernel parameters based on your specific hardware and running kernel. It provides predictable performance improvements by automatically detecting hardware and applying a tailored profile.
 
-> # Note: #
-> Not an official tool, community-made
-A hardened, XanMod-aware auto-tuner for Linux kernels, designed to optimize system performance, overriding the zram.service (it will shut off zram.service as this will handle it in its stead, but if you made a swap of 2G, the script will not ovveride the current swap, you will have to do that manually. I plan to fix that later), enables earlyoom, handles BRR, fq, and preload's service for desktop responsiveness and gaming. This script is fully compatible with XanMod kernels but will apply a balanced, performance-oriented profile to any Linux kernel. This tool is a component of the upcoming Griffin OS but is available here as an MIT-licensed open-source project.
+- Key FeaturesIntelligent Kernel Detection: Automatically identifies and tunes for XanMod, Liquorix, Zen, TKG, CK, Clear, and CachyOS kernels.Hardware Awareness: Detects if the system is a desktop, laptop, or handheld (like a Steam Deck or ROG Ally) to adjust power and performance balance. 
 
-https://github.com/bobbycomet/xanmod-kernel-update-tool. These tools complement each other.
+- Memory Management: Configures ZRAM and Zswap based on total RAM capacity.
 
-# Features
+- Optimizes swappiness, VFS cache pressure, and dirty ratios.
 
-Robust Kernel Detection: Accurately identifies XanMod, XanMod-RT, XanMod-LTS, and generic kernels to apply the most appropriate tunings.
+- Storage Optimization: Identifies SSD vs. HDD devices to set appropriate I/O schedulers (e.g., none for SSDs, bfq for HDDs).
 
-Adaptive Tuning: Automatically calculates optimal values for ZRAM size, swappiness, EarlyOOM thresholds, and Preload memory limits based on your system's detected RAM.
+- Enables fstrim.timer automatically for SSD maintenance.
 
-Network Tuning: Tunes the network stack by enabling Fair Queueing (fq) and, if supported, the BBR congestion control algorithm to improve network responsiveness and throughput.
+- Network Performance: Enables BBR TCP congestion control and optimizes buffer sizes for high-speed networking.
 
-Safe Execution: Features safe file writes, rigorous input validation, and a fallback to sensible defaults to prevent system instability.
+- CPU Tuning: Sets the scaling governor based on the detected device type and power source (AC vs. Battery).
 
-Persistent Configuration: Saves the detected, calculated, and applied settings to /etc/griffin/xanmod-autotune.conf, allowing for user overrides.
-
-Systemd Integration: Designed to be run automatically at boot via a systemd service, ensuring your tunings are always active.
-
-# How It Works
-
-The script runs at boot with root privileges. It checks your system's kernel and available RAM to determine a recommended set of tuning parameters. It then applies these settings using standard Linux utilities like sysctl, zram, and earlyoom. The script ensures that ZRAM is enabled, swappiness is configured for optimal performance, and that services like earlyoom and preload are configured with ideal thresholds.
-
-# Installation and Usage
-
-The recommended way to install xanmod-autotuner is by adding our apt repository and installing it with apt.
-
-Add the APT Repository and GPG Key
-
-First, import the GPG key used to sign the packages. This ensures that the packages you download are authentic.
-
-
+Once you have built the .deb package, install it using apt:
 ```
-sudo mkdir -p /etc/apt/keyrings
-wget -O- https://bobbycomet.github.io/xanmod-autotuner/dists/xanmod/Release.gpg | gpg --dearmor | sudo tee /etc/apt/keyrings/xanmod-autotuner.gpg >/dev/null
-```
-Next, add the repository to your system's sources list.
-
-
-```
-echo "deb [signed-by=/etc/apt/keyrings/xanmod-autotuner.gpg] https://bobbycomet.github.io/xanmod-autotuner/ xanmod main" | sudo tee /etc/apt/sources.list.d/xanmod-autotuner.list
+sudo apt install ./kernel-autotune.deb
 ```
 
-Finally, update your package list to include the new repository.
+## Usage
 
-
-```
-sudo apt update
-```
-
-# Install the Package
-
-Now, you can install the xanmod-autotuner package using apt.
+While the service runs automatically, you can interact with the script manually using the following commands:
 
 ```
-sudo apt install xanmod-autotuner
+kernel-autotune status
 ```
 
-The package will automatically install the script, set up the systemd service to run it at boot, and apply the tunings immediately.
-
-# Verify the Installation
-
-To confirm that the script ran successfully, you can check the status of the systemd service.
-
+Manual Apply: Re-run the detection and apply optimizations immediately.
 
 ```
-sudo systemctl status xanmod-autotuner.service
+sudo kernel-autotune apply
 ```
 
-You can also inspect the generated configuration file to see the values that were applied.
+View Logs: Check the history of applied changes.
 
 ```
-cat /etc/griffin/xanmod-autotune.conf
+tail -f /var/log/kernel-autotune.log
 ```
 
-# Advanced: Custom Overrides
+Configuration & State
 
-If you want to manually change a tuning value, you can edit the configuration file and set an override. For example, to set a fixed swappiness value of 10, you would edit /etc/griffin/xanmod-autotune.conf and change the line OVERRIDE_SWAPPINESS="" to OVERRIDE_SWAPPINESS="10".
+- Config File: /etc/kernel-autotune/config.sh (Generated based on hardware detection).
 
-After saving the file, simply run the script manually to apply the changes.
+- State File: /etc/kernel-autotune/state.json (Summary of the current active profile).
 
-```
-sudo /usr/local/bin/autotuner.sh
-```
-> #Note#: If you want to use the script from a different location, ensure you use the correct path.
+- Sysctl Drop-in: /etc/sysctl.d/99-kernel-autotune.conf.
 
-The autotuner is smart enough to know the difference. When it detects a generic kernel, it applies a basic performance profile, but when it sees a XanMod kernel, it knows it can do more. That's why it enables a special, advanced network tuning like BBR that other kernels don't support, proving that the right kernel makes a real difference in performance.
+Safety Features
 
-# Example: 
+- Deterministic Behavior: No runtime surprises; settings are validated against the current state.
 
-:~$ cat /etc/griffin/xanmod-autotune.conf
-# Griffin OS XanMod Auto-Tune Config
-# - Detected values (do not edit)
-DETECTED_KERNEL_RELEASE="6.11.0-26-generic"
+- Thermal Aware: Adjusts Transparent Huge Pages (THP) on laptops to reduce heat generation.
 
-DETECTED_KERNEL_BASE="6.11.0"
-
-DETECTED_KERNEL_FLAVOR="generic"
-
-DETECTED_KERNEL_VARIANT=""
-
-DETECTED_KERNEL_PKG="non-xanmod"
-
-DETECTED_RAM_MB="32039"
-
-DETECTED_RAM_GB="32"
-
-#- Calculated defaults (based on kernel+RAM)
-CALC_ZRAM_PCT="33"
-
-CALC_ZRAM_COMP="lz4"
-
-CALC_SWAPPINESS="60"
-
-CALC_EARLYOOM_MEM="5"
-
-CALC_EARLYOOM_SWAP="5"
-
-CALC_PRELOAD_MEMLIMIT="70"
-
-CALC_PRELOAD_ENABLE="1"
-
-#- Overrides (user-editable; leave empty to use calculated)
-
-OVERRIDE_ZRAM_PERCENT=""
-
-OVERRIDE_ZRAM_COMP=""
-
-OVERRIDE_SWAPPINESS=""
-
-OVERRIDE_EARLYOOM_MEM=""
-
-OVERRIDE_EARLYOOM_SWAP=""
-
-OVERRIDE_PRELOAD_MEMLIMIT=""
-
-OVERRIDE_PRELOAD_ENABLE=""
-
-#- Effective (applied this run)
-EFFECTIVE_ZRAM_PCT="33"
-
-EFFECTIVE_ZRAM_COMP="lz4"
-
-EFFECTIVE_SWAPPINESS="60"
-
-EFFECTIVE_EARLYOOM_MEM="5"
-
-EFFECTIVE_EARLYOOM_SWAP="5"
-
-EFFECTIVE_PRELOAD_MEMLIMIT="70"
-
-EFFECTIVE_PRELOAD_ENABLE="1"
-
-:~$ swapon --show
-
-NAME       TYPE      SIZE USED PRIO
-
-/swapfile  file        10.5G   0B   -2
-
-/dev/zram0 partition  64M 7.5M  100
-
-:~$ cat /proc/sys/vm/swappiness
-
-60
-
-
-:~$ cat /etc/sysctl.d/99-griffin-tune.conf
-
-#/etc/sysctl.d/99-griffin-tune.conf - auto-generated by xanmod-autotune.sh
-
-# Effective tuning for kernel=6.11.0-26-generic flavor=generic variant=none
-
-vm.swappiness=60
-
-vm.vfs_cache_pressure=100
-
-net.core.default_qdisc=fq
-
-cat /etc/sysctl.d/99-griffin-tune.conf
-
-#/etc/sysctl.d/99-griffin-tune.conf - auto-generated by xanmod-autotune.sh
-
-# Effective tuning for kernel=6.12.43-x64v1-xanmod1 flavor=headers-6 variant=x64v1
-
-vm.swappiness=60
-
-vm.vfs_cache_pressure=100
-
-net.core.default_qdisc=fq
-
-net.ipv4.tcp_congestion_control=bbr
-
-:~$ cat /proc/sys/vm/swappiness
-
-60
-
-# xanmod example 
-
-cat /etc/griffin/xanmod-autotune.conf
-
-Griffin OS XanMod Auto-Tune Config
-
-#- Detected values (do not edit)
-
-DETECTED_KERNEL_RELEASE="6.12.43-x64v1-xanmod1"
-
-DETECTED_KERNEL_BASE="6.12.43"
-
-DETECTED_KERNEL_FLAVOR="headers-6"
-
-DETECTED_KERNEL_VARIANT="x64v1"
-
-DETECTED_KERNEL_PKG="linux-headers-6-x64v1"
-
-DETECTED_RAM_MB="32041"
-
-DETECTED_RAM_GB="32"
-
-
-#- Calculated defaults (based on kernel+RAM)
-
-CALC_ZRAM_PCT="33"
-
-CALC_ZRAM_COMP="lz4"
-
-CALC_SWAPPINESS="60"
-
-CALC_EARLYOOM_MEM="5"
-
-CALC_EARLYOOM_SWAP="5"
-
-CALC_PRELOAD_MEMLIMIT="60"
-
-CALC_PRELOAD_ENABLE="1"
-
-#- Overrides (user-editable; leave empty to use calculated)
-
-OVERRIDE_ZRAM_PERCENT=""
-
-OVERRIDE_ZRAM_COMP=""
-
-OVERRIDE_SWAPPINESS=""
-
-OVERRIDE_EARLYOOM_MEM=""
-
-OVERRIDE_EARLYOOM_SWAP=""
-
-OVERRIDE_PRELOAD_MEMLIMIT=""
-
-OVERRIDE_PRELOAD_ENABLE=""
-
-#- Effective (applied this run)
-
-EFFECTIVE_ZRAM_PCT="33"
-
-EFFECTIVE_ZRAM_COMP="lz4"
-
-EFFECTIVE_SWAPPINESS="60"
-
-EFFECTIVE_EARLYOOM_MEM="5"
-
-EFFECTIVE_EARLYOOM_SWAP="5"
-
-EFFECTIVE_PRELOAD_MEMLIMIT="60"
-
-EFFECTIVE_PRELOAD_ENABLE="1"
-
-$ swapon --show
-
-NAME       TYPE      SIZE USED PRIO
-
-/swapfile  file        10.5G   0B   -2
-
-/dev/zram0 partition  64M   0B  100
-
-
-:~$ cat /proc/sys/vm/swappiness
-
-60
-
-
-$ cat /etc/sysctl.d/99-griffin-tune.conf
-
-#/etc/sysctl.d/99-griffin-tune.conf - auto-generated by xanmod-autotune.sh
-
-#Effective tuning for kernel=6.12.43-x64v1-xanmod1 flavor=headers-6 variant=x64v1
-
-vm.swappiness=60
-
-vm.vfs_cache_pressure=100
-
-net.core.default_qdisc=fq
-
-net.ipv4.tcp_congestion_control=bbr
-
-
-
+- Fallback Chains: Uses safe defaults if specific kernel features or schedulers are missing.
