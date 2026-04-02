@@ -14,6 +14,8 @@
 
 - CPU Tuning: Sets the scaling governor based on the detected device type and power source (AC vs. Battery).
 
+Get the deb here: https://github.com/bobbycomet/kernel-autotune-V2/releases/download/v2.0.0/kernel-autotune-pkg.deb
+
 Once you have built the .deb package, install it using apt:
 ```
 sudo apt install ./kernel-autotune.deb
