@@ -49,7 +49,7 @@ tail -f /var/log/kernel-autotune.log
 
 Configuration & State
 
-- Config File: /etc/kernel-autotune/config.sh (Generated based on hardware detection).
+- Config File: /etc/kernel-autotune/config.sh (Generated based on hardware detection, can be edited as you see fit).
 
 - State File: /etc/kernel-autotune/state.json (Summary of the current active profile).
 
