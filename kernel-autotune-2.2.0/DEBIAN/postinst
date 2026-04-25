@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+# Load the new service file from /etc/systemd/system/
+systemctl daemon-reload
+
+# Make sure it stays enabled
+systemctl enable kernel-autotune.service
+
+# FORCE the new 2.2.0 logic to run right now
+systemctl restart kernel-autotune.service
+
+exit 0

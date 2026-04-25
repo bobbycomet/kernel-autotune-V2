@@ -1,0 +1,1108 @@
+#!/usr/bin/env bash
+# kernel-autotune v2.2.0
+# Intelligent kernel tuning with predictable behavior and safety.
+#
+# Usage: kernel-autotune [--dry-run] [--quiet|--verbose] {install|apply|regen-config|uninstall|status|--version}
+SCRIPT_VERSION="2.2.0"
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_NAME="$(basename "$0")"
+WORKDIR="/etc/kernel-autotune"
+CONFIG_FILE="$WORKDIR/config.sh"
+STATE_FILE="$WORKDIR/state.json"
+SYSCTL_CONF="/etc/sysctl.d/99-kernel-autotune.conf"
+ZRAM_SCRIPT="/usr/local/bin/kernel-autotune-zram.sh"
+LOG_FILE="/var/log/kernel-autotune.log"
+LOCK_FILE="/run/kernel-autotune.lock"
+
+# ---- Logging level ----
+# 0 = quiet (warnings/errors only), 1 = normal (default), 2 = verbose
+LOG_LEVEL=1
+# Dry-run: print what would happen without making any changes
+DRY_RUN=0
+
+# ==================== Logging ====================
+_write_log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): [$SCRIPT_NAME v${SCRIPT_VERSION}] $*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+log() {
+    # Normal messages — suppressed in quiet mode
+    [ "$LOG_LEVEL" -ge 1 ] && echo "[$SCRIPT_NAME] $*"
+    _write_log "$*"
+}
+
+verbose() {
+    # Detail messages — only shown in verbose mode, always logged
+    [ "$LOG_LEVEL" -ge 2 ] && echo "[$SCRIPT_NAME] $*"
+    _write_log "[verbose] $*"
+}
+
+warn() {
+    # Warnings — always shown regardless of log level
+    echo "[$SCRIPT_NAME] WARNING: $*" >&2
+    _write_log "WARNING: $*"
+}
+
+error() {
+    echo "[$SCRIPT_NAME] ERROR: $*" >&2
+    _write_log "ERROR: $*"
+    exit 1
+}
+
+dry_run_notice() {
+    # Print a dry-run action instead of performing it
+    echo "[DRY RUN] $*"
+    _write_log "[dry-run] $*"
+}
+
+# Fix #31: Use id -u instead of $EUID so this works under sh as well as bash.
+need_root() {
+    # Dry-run can be used without root since nothing is written
+    [ "$DRY_RUN" = "1" ] && return 0
+    if [ "$(id -u)" -ne 0 ]; then
+        error "Must run as root (or use --dry-run to preview without root)"
+    fi
+}
+
+# Fix #23: Acquire an exclusive lock so concurrent invocations don't race on
+# config/state files or sysfs writes.
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        error "Another instance of $SCRIPT_NAME is already running (lock: $LOCK_FILE)"
+    fi
+}
+
+# ==================== System Detection ====================
+detect_kernel() {
+    local k
+    k="$(uname -r | tr '[:upper:]' '[:lower:]')"
+
+    # Fix #25: Anchor "ck" with a leading hyphen/dot so it doesn't match
+    # unrelated substrings like "rockchip" or "pocketbook".
+    if   [[ "$k" == *xanmod* ]];    then echo "xanmod"
+    elif [[ "$k" == *liquorix* ]];  then echo "liquorix"
+    elif [[ "$k" == *zen* ]];       then echo "zen"
+    elif [[ "$k" == *tkg* ]];       then echo "tkg"
+    elif [[ "$k" == *-ck* || "$k" == *-ck[0-9]* ]]; then echo "ck"
+    elif [[ "$k" == *clear* ]];     then echo "clear"
+    elif [[ "$k" == *cachyos* ]];   then echo "cachyos"
+    else echo "generic"
+    fi
+}
+
+is_laptop() {
+    # Fix #5: grep the *contents* of the type files, not their paths.
+    [ -d /sys/class/power_supply ] && \
+        grep -qil battery /sys/class/power_supply/*/type 2>/dev/null
+}
+
+is_handheld() {
+    # Fix #16: Use DMI product name (hardware-set) instead of hostname (user-set).
+    local product=""
+    product="$(cat /sys/class/dmi/id/product_name 2>/dev/null | tr '[:upper:]' '[:lower:]')" || true
+    [[ "$product" == *"jupiter"* ]] ||   # Steam Deck LCD
+    [[ "$product" == *"galileo"* ]] ||   # Steam Deck OLED
+    [[ "$product" == *"ally"* ]]    ||   # ASUS ROG Ally
+    [[ "$product" == *"go 1405"* ]] ||   # Lenovo Legion Go
+    [ -e /sys/class/power_supply/axp20x-battery ]
+}
+
+get_ram_mb() {
+    awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo
+}
+
+get_cpu_cores() {
+    nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo || echo 1
+}
+
+is_numa_system() {
+    # Fix #4: wc -w on a cpulist like "4-7" always returns 1 (one token).
+    # Instead check that the file is non-empty, which reliably indicates
+    # that node1 has CPUs assigned to it.
+    [ -d /sys/devices/system/node/node1 ] && \
+        [ -s /sys/devices/system/node/node1/cpulist ]
+}
+
+# Detect SSD/NVMe devices.
+has_ssd() {
+    local found=0
+    for disk in /sys/block/sd* /sys/block/nvme*; do
+        [ -e "$disk/queue/rotational" ] || continue
+        if [ "$(cat "$disk/queue/rotational" 2>/dev/null || echo 1)" -eq 0 ]; then
+            found=1
+            break
+        fi
+    done
+    echo $found
+}
+
+has_thermal_control() {
+    [ -d /sys/class/thermal/thermal_zone0 ] && \
+        [ -e /sys/class/thermal/thermal_zone0/temp ]
+}
+
+# Fix #36/#37: Check whether a TCP congestion algorithm is available in the kernel.
+get_tcp_congestion() {
+    local preferred="$1"
+    local fallback="$2"
+    if [ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]; then
+        if grep -qw "$preferred" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            echo "$preferred"
+            return
+        fi
+    fi
+    echo "$fallback"
+}
+
+# Fix #37: Pair qdisc with the chosen congestion algorithm.
+get_net_qdisc() {
+    local algo="$1"
+    # fq pairs specifically with BBR; fq_codel is better for other algorithms.
+    if [ "$algo" = "bbr" ]; then
+        echo "fq"
+    else
+        echo "fq_codel"
+    fi
+}
+
+# ==================== Configuration Generation ====================
+generate_config() {
+    mkdir -p "$WORKDIR"
+
+    local KERNEL
+    KERNEL=$(detect_kernel)
+    local DEVICE_TYPE="desktop"
+    local RAM_MB
+    RAM_MB=$(get_ram_mb)
+    local CPU_CORES
+    CPU_CORES=$(get_cpu_cores)
+    local HAS_SSD
+    HAS_SSD=$(has_ssd)
+    local IS_NUMA
+    IS_NUMA=$(is_numa_system && echo 1 || echo 0)
+    # Fix #45: Persist HAS_THERMAL alongside all other detected values.
+    local HAS_THERMAL
+    HAS_THERMAL=$(has_thermal_control && echo 1 || echo 0)
+
+    # Determine device type
+    if is_handheld; then
+        DEVICE_TYPE="handheld"
+    elif is_laptop; then
+        DEVICE_TYPE="laptop"
+    fi
+
+    log "Detected: $KERNEL kernel, $DEVICE_TYPE, ${RAM_MB}MB RAM, $CPU_CORES cores," \
+        "SSD=$HAS_SSD, NUMA=$IS_NUMA, THERMAL=$HAS_THERMAL"
+
+    # ==================== Base Defaults ====================
+    SWAPPINESS=15
+    DIRTY_RATIO=15
+    DIRTY_BG_RATIO=5
+    VFS_CACHE_PRESSURE=60
+    CPU_GOVERNOR="schedutil"
+    THP="madvise"
+    ZRAM_ENABLED=1
+    ZRAM_RATIO=50
+    ZRAM_ALGO="zstd"
+    ZSWAP_ENABLED=0
+    NUMA_BALANCING=1
+    COMPACT_UNEVICTABLE=1
+    IO_SCHEDULER_SSD="mq-deadline"
+    IO_SCHEDULER_HDD="bfq"
+
+    # Fix #36/#37: Probe actual kernel support before committing to BBR/fq.
+    TCP_CONGESTION=$(get_tcp_congestion "bbr" "cubic")
+    NET_QDISC=$(get_net_qdisc "$TCP_CONGESTION")
+
+    # ==================== Kernel-Specific Tuning ====================
+    case "$KERNEL" in
+        xanmod)
+            SWAPPINESS=10
+            DIRTY_RATIO=20
+            CPU_GOVERNOR="performance"
+            THP="madvise"
+            ZRAM_ALGO="zstd"
+            TCP_CONGESTION=$(get_tcp_congestion "bbr" "cubic")
+            NET_QDISC=$(get_net_qdisc "$TCP_CONGESTION")
+            ;;
+        liquorix|zen|cachyos)
+            SWAPPINESS=20
+            DIRTY_RATIO=15
+            CPU_GOVERNOR="schedutil"
+            ZRAM_RATIO=60
+            ;;
+        tkg)
+            SWAPPINESS=12
+            CPU_GOVERNOR="performance"
+            ZRAM_RATIO=55
+            ;;
+        ck|clear)
+            SWAPPINESS=8
+            CPU_GOVERNOR="performance"
+            DIRTY_RATIO=10
+            ;;
+        generic)
+            SWAPPINESS=15
+            CPU_GOVERNOR="schedutil"
+            THP="defer+madvise"
+            ;;
+    esac
+
+    # ==================== RAM-Based Adjustments ====================
+    # Fix #39: Run RAM adjustments BEFORE device-type adjustments so that
+    # device-type settings (e.g. handheld ZRAM_RATIO=100) take final precedence.
+    if [ "$RAM_MB" -le 2048 ]; then
+        ZRAM_ENABLED=1
+        ZRAM_RATIO=150
+        ZSWAP_ENABLED=0
+        SWAPPINESS=30
+        VFS_CACHE_PRESSURE=80
+    elif [ "$RAM_MB" -le 4096 ]; then
+        ZRAM_ENABLED=1
+        ZRAM_RATIO=100
+        ZSWAP_ENABLED=0
+        SWAPPINESS=25
+    elif [ "$RAM_MB" -le 8192 ]; then
+        ZRAM_ENABLED=1
+        ZRAM_RATIO=75
+        ZSWAP_ENABLED=1
+    elif [ "$RAM_MB" -le 16384 ]; then
+        ZRAM_RATIO=50
+    else
+        ZRAM_RATIO=30
+        SWAPPINESS=5
+    fi
+
+    # ==================== Device Type Adjustments ====================
+    # (Runs after RAM so device-type settings win on conflict — fix #39)
+    case "$DEVICE_TYPE" in
+        handheld)
+            CPU_GOVERNOR="schedutil"
+            SWAPPINESS=25
+            ZRAM_RATIO=100
+            ZRAM_ALGO="lz4"
+            THP="never"
+            DIRTY_RATIO=10
+            ;;
+        laptop)
+            CPU_GOVERNOR="schedutil"
+            SWAPPINESS=$((SWAPPINESS + 5))
+            ZRAM_ALGO="lz4"
+            if [ "$HAS_THERMAL" -eq 1 ]; then
+                THP="defer+madvise"
+            fi
+            ;;
+        desktop)
+            # Keep optimized settings from kernel/RAM defaults.
+            ;;
+    esac
+
+    # ==================== NUMA Adjustments ====================
+    if [ "$IS_NUMA" -eq 1 ]; then
+        NUMA_BALANCING=1
+        VFS_CACHE_PRESSURE=50
+    else
+        NUMA_BALANCING=0
+    fi
+
+    # ==================== SSD Optimizations ====================
+    if [ "$HAS_SSD" -eq 1 ]; then
+        DIRTY_RATIO=20
+        DIRTY_BG_RATIO=10
+        IO_SCHEDULER_SSD="none"
+    fi
+
+    # Fix #40: Derive writeback timings from dirty ratio for internal consistency.
+    # dirty_expire_centisecs: how long data sits dirty before forced writeout.
+    # dirty_writeback_centisecs: how often the writeback thread wakes.
+    # Keep expire >= 2× writeback. Scale both with DIRTY_RATIO.
+    DIRTY_WRITEBACK_CS=$(( 500 + DIRTY_RATIO * 50 ))   # 1000-2500cs range
+    DIRTY_EXPIRE_CS=$(( DIRTY_WRITEBACK_CS * 2 ))
+
+    # ==================== Write Configuration ====================
+    # Fix #44: Sanitize values that come from external sources before writing
+    # them into a file that will be sourced as shell code.
+    _sanitize() {
+        # Allow only alphanumerics, hyphen, underscore, dot, plus.
+        echo "$1" | tr -cd 'a-zA-Z0-9_.+-'
+    }
+    KERNEL=$(_sanitize "$KERNEL")
+    DEVICE_TYPE=$(_sanitize "$DEVICE_TYPE")
+    ZRAM_ALGO=$(_sanitize "$ZRAM_ALGO")
+    CPU_GOVERNOR=$(_sanitize "$CPU_GOVERNOR")
+    THP=$(_sanitize "$THP")
+    TCP_CONGESTION=$(_sanitize "$TCP_CONGESTION")
+    NET_QDISC=$(_sanitize "$NET_QDISC")
+    IO_SCHEDULER_SSD=$(_sanitize "$IO_SCHEDULER_SSD")
+    IO_SCHEDULER_HDD=$(_sanitize "$IO_SCHEDULER_HDD")
+
+    cat > "$CONFIG_FILE" <<EOF
+# kernel-autotune configuration — generated from hardware detection.
+# This file is YOURS to edit. Changes persist across reboots and apply runs.
+#
+# To apply your changes now:   sudo kernel-autotune apply
+# To reset to detected defaults: sudo kernel-autotune regen-config
+#
+# Generated: $(date)
+# Script version: $SCRIPT_VERSION
+# Kernel: $KERNEL | Device: $DEVICE_TYPE | RAM: ${RAM_MB}MB | Cores: $CPU_CORES
+
+# Memory
+SWAPPINESS=$SWAPPINESS
+DIRTY_RATIO=$DIRTY_RATIO
+DIRTY_BG_RATIO=$DIRTY_BG_RATIO
+DIRTY_WRITEBACK_CS=$DIRTY_WRITEBACK_CS
+DIRTY_EXPIRE_CS=$DIRTY_EXPIRE_CS
+VFS_CACHE_PRESSURE=$VFS_CACHE_PRESSURE
+
+# CPU
+CPU_GOVERNOR="$CPU_GOVERNOR"
+THP="$THP"
+
+# Swap/Compression
+ZRAM_ENABLED=$ZRAM_ENABLED
+ZRAM_RATIO=$ZRAM_RATIO
+ZRAM_ALGO="$ZRAM_ALGO"
+ZSWAP_ENABLED=$ZSWAP_ENABLED
+
+# System
+NUMA_BALANCING=$NUMA_BALANCING
+COMPACT_UNEVICTABLE=$COMPACT_UNEVICTABLE
+
+# IO
+IO_SCHEDULER_SSD="$IO_SCHEDULER_SSD"
+IO_SCHEDULER_HDD="$IO_SCHEDULER_HDD"
+
+# Network
+TCP_CONGESTION="$TCP_CONGESTION"
+NET_QDISC="$NET_QDISC"
+
+# Detection results
+KERNEL="$KERNEL"
+DEVICE_TYPE="$DEVICE_TYPE"
+RAM_MB=$RAM_MB
+CPU_CORES=$CPU_CORES
+HAS_SSD=$HAS_SSD
+IS_NUMA=$IS_NUMA
+HAS_THERMAL=$HAS_THERMAL
+EOF
+
+    # Fix #29: Use printf for JSON to avoid injection from shell variable content.
+    python3 -c "
+import json, sys
+data = {
+    'script_version': '$SCRIPT_VERSION',
+    'last_updated': '$(date -Iseconds)',
+    'kernel': '$KERNEL',
+    'device_type': '$DEVICE_TYPE',
+    'ram_mb': $RAM_MB,
+    'cpu_cores': $CPU_CORES,
+    'has_ssd': $HAS_SSD,
+    'is_numa': $IS_NUMA,
+    'has_thermal': $HAS_THERMAL,
+    'config': {
+        'swappiness': $SWAPPINESS,
+        'dirty_ratio': $DIRTY_RATIO,
+        'dirty_bg_ratio': $DIRTY_BG_RATIO,
+        'vfs_cache_pressure': $VFS_CACHE_PRESSURE,
+        'cpu_governor': '$CPU_GOVERNOR',
+        'thp': '$THP',
+        'zram_enabled': $ZRAM_ENABLED,
+        'zram_ratio': $ZRAM_RATIO,
+        'zram_algo': '$ZRAM_ALGO',
+        'zswap_enabled': $ZSWAP_ENABLED,
+        'tcp_congestion': '$TCP_CONGESTION',
+        'net_qdisc': '$NET_QDISC',
+    }
+}
+print(json.dumps(data, indent=2))
+" > "$STATE_FILE"
+
+    log "Configuration generated and saved (version $SCRIPT_VERSION)"
+}
+
+# ==================== Config Validation & Migration ====================
+# Validates config.sh before sourcing it. For keys that are missing but can be
+# re-detected at runtime (detection results like HAS_THERMAL, IS_NUMA, etc.),
+# they are appended to the config automatically rather than failing the boot.
+# Only truly required tuning keys (user-editable settings) cause a hard failure.
+validate_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        error "Config file not found: $CONFIG_FILE — run 'kernel-autotune regen-config' to create it"
+    fi
+
+    # Syntax check first — a broken file is always fatal
+    if ! bash -n "$CONFIG_FILE" 2>/dev/null; then
+        error "Config file has a syntax error: $CONFIG_FILE
+Run 'kernel-autotune regen-config' to reset it, or fix the error manually."
+    fi
+
+    # Keys are split into two categories:
+    #   required   — user-editable tuning settings; must be present to apply safely
+    #   detectable — hardware/kernel detection results; can be re-detected and appended
+    local required_keys=(
+        SWAPPINESS DIRTY_RATIO DIRTY_BG_RATIO VFS_CACHE_PRESSURE
+        CPU_GOVERNOR THP
+        ZRAM_ENABLED ZRAM_RATIO ZRAM_ALGO ZSWAP_ENABLED
+        NUMA_BALANCING COMPACT_UNEVICTABLE
+        IO_SCHEDULER_SSD IO_SCHEDULER_HDD
+        TCP_CONGESTION NET_QDISC
+    )
+    local detectable_keys=(
+        KERNEL DEVICE_TYPE RAM_MB CPU_CORES HAS_SSD IS_NUMA HAS_THERMAL
+    )
+
+    # Check for missing keys by sourcing into a subshell
+    local missing_required=()
+    local missing_detectable=()
+
+    for key in "${required_keys[@]}"; do
+        if ! bash -c "source \"$CONFIG_FILE\" 2>/dev/null && [ -n \"\${${key}+x}\" ]" 2>/dev/null; then
+            missing_required+=("$key")
+        fi
+    done
+    for key in "${detectable_keys[@]}"; do
+        if ! bash -c "source \"$CONFIG_FILE\" 2>/dev/null && [ -n \"\${${key}+x}\" ]" 2>/dev/null; then
+            missing_detectable+=("$key")
+        fi
+    done
+
+    # Hard failure for missing required keys — these can't be safely defaulted
+    if [ "${#missing_required[@]}" -gt 0 ]; then
+        error "Config file is missing required tuning keys: ${missing_required[*]}
+Edit $CONFIG_FILE to add them, or run 'kernel-autotune regen-config' to reset."
+    fi
+
+    # Auto-migrate missing detectable keys — re-detect and append to config
+    if [ "${#missing_detectable[@]}" -gt 0 ]; then
+        warn "Config is missing detection keys (likely from an older version): ${missing_detectable[*]}"
+        warn "Re-detecting and appending them to $CONFIG_FILE automatically..."
+
+        # Build the migration block as a variable first, so no stray output
+        # (log calls, subshell noise) ends up inside the config file.
+        local migration_lines
+        migration_lines="$(printf '\n# Auto-migrated by kernel-autotune v%s on %s\n' "$SCRIPT_VERSION" "$(date)")"
+
+        for key in "${missing_detectable[@]}"; do
+            local val=""
+            case "$key" in
+                KERNEL)      val=$(detect_kernel) ;;
+                DEVICE_TYPE)
+                    if is_handheld; then val="handheld"
+                    elif is_laptop; then val="laptop"
+                    else val="desktop"; fi ;;
+                RAM_MB)      val=$(get_ram_mb) ;;
+                CPU_CORES)   val=$(get_cpu_cores) ;;
+                HAS_SSD)     val=$(has_ssd) ;;
+                IS_NUMA)     val=$(is_numa_system && echo 1 || echo 0) ;;
+                HAS_THERMAL) val=$(has_thermal_control && echo 1 || echo 0) ;;
+                *)           val="0" ;;
+            esac
+            migration_lines+="$(printf '%s=%s\n' "$key" "$val")"
+            # Log to file only (not stdout) so it doesn't pollute the config
+            _write_log "Migrated: ${key}=${val}"
+        done
+
+        # Append only the clean key=value lines to the config file
+        printf '%s\n' "$migration_lines" >> "$CONFIG_FILE"
+
+        log "Config migration complete. Keys appended to $CONFIG_FILE."
+    fi
+
+    # Range/value sanity checks — catch obvious user errors in editable fields
+    local check
+    check=$(bash -c "source \"$CONFIG_FILE\" 2>/dev/null
+        [ \"\$SWAPPINESS\" -ge 0 ] && [ \"\$SWAPPINESS\" -le 200 ] \
+            || echo 'SWAPPINESS must be 0-200'
+        [ \"\$DIRTY_RATIO\" -ge 1 ] && [ \"\$DIRTY_RATIO\" -le 100 ] \
+            || echo 'DIRTY_RATIO must be 1-100'
+        [ \"\$DIRTY_BG_RATIO\" -ge 0 ] && [ \"\$DIRTY_BG_RATIO\" -le 100 ] \
+            || echo 'DIRTY_BG_RATIO must be 0-100'
+        [ \"\$ZRAM_RATIO\" -ge 0 ] && [ \"\$ZRAM_RATIO\" -le 300 ] \
+            || echo 'ZRAM_RATIO must be 0-300'
+        [[ \"\$ZRAM_ENABLED\" == '0' || \"\$ZRAM_ENABLED\" == '1' ]] \
+            || echo 'ZRAM_ENABLED must be 0 or 1'
+        [[ \"\$ZSWAP_ENABLED\" == '0' || \"\$ZSWAP_ENABLED\" == '1' ]] \
+            || echo 'ZSWAP_ENABLED must be 0 or 1'
+        [[ \"\$THP\" == 'always' || \"\$THP\" == 'madvise' \
+            || \"\$THP\" == 'never' || \"\$THP\" == 'defer+madvise' ]] \
+            || echo \"THP must be: always, madvise, defer+madvise, or never (got: \$THP)\"
+    " 2>/dev/null)
+
+    if [ -n "$check" ]; then
+        error "Config file has invalid values:
+$check
+
+Edit $CONFIG_FILE or run 'kernel-autotune regen-config' to reset."
+    fi
+
+    verbose "Config validated: $CONFIG_FILE"
+    return 0
+}
+
+# ==================== Sysctl Tuning ====================
+apply_sysctl() {
+    # Config has already been validated and sourced by apply_all before this is called.
+
+    local sysctl_content
+    sysctl_content="$(cat <<EOF
+# Kernel Autotune v${SCRIPT_VERSION} - $(date)
+# Profile: $KERNEL kernel on $DEVICE_TYPE
+
+# Kernel
+kernel.sysrq = 16
+kernel.numa_balancing = $NUMA_BALANCING
+kernel.panic = 10
+kernel.panic_on_oops = 1
+
+# Memory Management
+vm.swappiness = $SWAPPINESS
+vm.vfs_cache_pressure = $VFS_CACHE_PRESSURE
+vm.dirty_ratio = $DIRTY_RATIO
+vm.dirty_background_ratio = $DIRTY_BG_RATIO
+vm.dirty_expire_centisecs = $DIRTY_EXPIRE_CS
+vm.dirty_writeback_centisecs = $DIRTY_WRITEBACK_CS
+vm.compact_unevictable_allowed = $COMPACT_UNEVICTABLE
+vm.overcommit_memory = 0
+
+# Network Performance
+net.core.default_qdisc = $NET_QDISC
+net.ipv4.tcp_congestion_control = $TCP_CONGESTION
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_window_scaling = 1
+
+# File System
+fs.file-max = 2097152
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 1024
+EOF
+)"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would write $SYSCTL_CONF and run: sysctl --load=$SYSCTL_CONF"
+        verbose "Sysctl content that would be written:"
+        echo "$sysctl_content" | sed 's/^/  [dry-run] /'
+        return 0
+    fi
+
+    echo "$sysctl_content" > "$SYSCTL_CONF"
+
+    if ! sysctl --load="$SYSCTL_CONF" 2>&1 | tee -a "$LOG_FILE"; then
+        warn "Some sysctl settings failed (may be OK if kernel doesn't support them)"
+    else
+        log "Sysctl settings applied successfully"
+    fi
+}
+
+# ==================== ZRAM Setup ====================
+setup_zram() {
+    [ "$ZRAM_ENABLED" -eq 0 ] && return 0
+
+    local RAM_MB
+    RAM_MB=$(get_ram_mb)
+    local ZRAM_SIZE_MB=$(( RAM_MB * ZRAM_RATIO / 100 ))
+    local NUM_DEVICES
+    NUM_DEVICES=$(get_cpu_cores)
+
+    [ "$NUM_DEVICES" -gt 8 ] && NUM_DEVICES=8
+    [ "$NUM_DEVICES" -lt 1 ] && NUM_DEVICES=1
+
+    local REMAINDER=$(( ZRAM_SIZE_MB % NUM_DEVICES ))
+    [ "$REMAINDER" -ne 0 ] && \
+        verbose "ZRAM: ${ZRAM_SIZE_MB}MB / ${NUM_DEVICES} devices leaves ${REMAINDER}MB unallocated"
+
+    if [ -z "${ZRAM_ALGO:-}" ]; then
+        ZRAM_ALGO="lz4"
+        warn "ZRAM_ALGO was empty; defaulting to lz4"
+    fi
+
+    # ---- Idempotency check ----
+    # If active zram devices already match what we'd configure, skip teardown/rebuild.
+    local PER_DEVICE_MB=$(( ZRAM_SIZE_MB / NUM_DEVICES ))
+    [ "$PER_DEVICE_MB" -lt 32 ] && PER_DEVICE_MB=32
+    local EXPECTED_TOTAL_MB=$(( PER_DEVICE_MB * NUM_DEVICES ))
+
+    local active_count active_size_mb already_correct=0
+    active_count=$(awk '/zram/ {count++} END {print count+0}' /proc/swaps 2>/dev/null || echo 0)
+    active_size_mb=$(awk '/zram/ {sum+=$3} END {printf "%d", sum/1024}' /proc/swaps 2>/dev/null || echo 0)
+
+    if [ "$active_count" -eq "$NUM_DEVICES" ] && [ "$active_size_mb" -eq "$EXPECTED_TOTAL_MB" ]; then
+        verbose "ZRAM already configured: $active_count devices, ~${active_size_mb}MB active. Skipping rebuild."
+        log "ZRAM unchanged (idempotent skip)"
+        return 0
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would configure ZRAM: $NUM_DEVICES devices," \
+                       "${EXPECTED_TOTAL_MB}MB total (${PER_DEVICE_MB}MB each), algo=$ZRAM_ALGO"
+        return 0
+    fi
+
+    # ---- Disable zswap before activating zram ----
+    if [ -f /sys/module/zswap/parameters/enabled ]; then
+        echo "N" > /sys/module/zswap/parameters/enabled 2>/dev/null || true
+        verbose "Disabled zswap before activating zram"
+    fi
+
+    # ---- Write the zram script with parameters baked in, then execute it ----
+    # The standalone kernel-autotune-zram.sh is the canonical implementation.
+    # We set env vars and invoke it rather than embedding duplicate logic here.
+    cat > "$ZRAM_SCRIPT" <<EOF
+#!/usr/bin/env bash
+# Generated by kernel-autotune v${SCRIPT_VERSION} on $(date)
+# Parameters are baked in; edit /etc/kernel-autotune/config.sh to change them.
+export NUM_DEVICES=$NUM_DEVICES
+export ZRAM_SIZE_MB=$ZRAM_SIZE_MB
+export ZRAM_ALGO="$ZRAM_ALGO"
+export ZRAM_STRICT=0
+export ZRAM_DRY_RUN=0
+EOF
+    # Append canonical implementation from the installed standalone script
+    tail -n +16 /usr/local/bin/kernel-autotune-zram.sh >> "$ZRAM_SCRIPT" 2>/dev/null || {
+        # Standalone script not installed yet (first-time install path) —
+        # fall back to direct invocation with env vars
+        rm -f "$ZRAM_SCRIPT"
+        NUM_DEVICES=$NUM_DEVICES ZRAM_SIZE_MB=$ZRAM_SIZE_MB \
+            ZRAM_ALGO=$ZRAM_ALGO ZRAM_STRICT=0 \
+            /usr/local/bin/kernel-autotune-zram.sh 2>&1 | tee -a "$LOG_FILE"
+        log "ZRAM configured via direct invocation"
+        return 0
+    }
+
+    chmod +x "$ZRAM_SCRIPT"
+
+    if "$ZRAM_SCRIPT" 2>&1 | tee -a "$LOG_FILE"; then
+        log "ZRAM configured: $NUM_DEVICES devices, ${ZRAM_SIZE_MB}MB total"
+    else
+        warn "ZRAM setup encountered issues — check log for details"
+    fi
+}
+
+# ==================== ZSWAP Setup ====================
+setup_zswap() {
+    # Fix #20: Config already sourced by apply_all.
+    [ "$ZSWAP_ENABLED" -eq 0 ] && return 0
+
+    if [ "$ZRAM_ENABLED" -eq 1 ]; then
+        warn "ZSWAP skipped: ZRAM is enabled. Enabling both simultaneously causes double-compression."
+        return 0
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would enable zswap with algo=$ZRAM_ALGO, zpool=z3fold, max_pool_percent=20"
+        return 0
+    fi
+
+    if [ -d /sys/module/zswap ]; then
+        echo "Y" > /sys/module/zswap/parameters/enabled 2>/dev/null || true
+        if echo "$ZRAM_ALGO" > /sys/module/zswap/parameters/compressor 2>/dev/null; then
+            :
+        elif echo "lz4" > /sys/module/zswap/parameters/compressor 2>/dev/null; then
+            warn "ZSWAP: ${ZRAM_ALGO} unavailable, fell back to lz4"
+        fi
+        echo "z3fold" > /sys/module/zswap/parameters/zpool 2>/dev/null || \
+            echo "zbud"   > /sys/module/zswap/parameters/zpool 2>/dev/null || true
+        echo 20 > /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || true
+        log "ZSWAP enabled"
+    fi
+}
+
+# ==================== IO Scheduler ====================
+tune_io_scheduler() {
+    for device in /sys/block/*; do
+        [ -e "$device/queue/scheduler" ] || continue
+
+        local dev_name
+        dev_name=$(basename "$device")
+
+        [[ "$dev_name" == loop* ]] && continue
+        [[ "$dev_name" == zram* ]] && continue
+        [[ "$dev_name" == sr*   ]] && continue
+        [[ "$dev_name" == dm-*  ]] && continue
+
+        local is_rotational
+        is_rotational=$(cat "$device/queue/rotational" 2>/dev/null || echo 0)
+        local scheduler
+
+        if [ "$is_rotational" -eq 1 ]; then
+            scheduler="$IO_SCHEDULER_HDD"
+        else
+            scheduler="$IO_SCHEDULER_SSD"
+        fi
+
+        if grep -qw "$scheduler" "$device/queue/scheduler" 2>/dev/null; then
+            if [ "$DRY_RUN" = "1" ]; then
+                dry_run_notice "Would set $dev_name scheduler to $scheduler"
+            else
+                echo "$scheduler" > "$device/queue/scheduler" 2>/dev/null && \
+                    verbose "Set $dev_name scheduler to $scheduler" || true
+            fi
+        else
+            verbose "$dev_name: scheduler $scheduler not available, skipping"
+        fi
+    done
+    [ "$DRY_RUN" != "1" ] && log "IO schedulers applied"
+}
+
+# ==================== CPU Governor ====================
+tune_cpu_governor() {
+    local target="$CPU_GOVERNOR"
+
+    if [ "$DEVICE_TYPE" = "laptop" ] || [ "$DEVICE_TYPE" = "handheld" ]; then
+        local ac_online=1
+        for ac in /sys/class/power_supply/AC/online \
+                  /sys/class/power_supply/AC0/online \
+                  /sys/class/power_supply/ACAD/online \
+                  /sys/class/power_supply/ADP1/online \
+                  /sys/class/power_supply/ADP0/online; do
+            if [ -r "$ac" ]; then
+                ac_online=$(cat "$ac" 2>/dev/null || echo 1)
+                break
+            fi
+        done
+        if [ "$ac_online" -eq 0 ]; then
+            verbose "On battery — overriding CPU governor to schedutil"
+            target="schedutil"
+        fi
+    fi
+
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would set CPU governor to $target on all cores"
+        return 0
+    fi
+
+    local governor_set=0
+    for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -w "$gov_file" ] || continue
+        local available
+        available=$(cat "$(dirname "$gov_file")/scaling_available_governors" 2>/dev/null || echo "")
+        if [[ "$available" == *"$target"* ]]; then
+            echo "$target" > "$gov_file" 2>/dev/null && governor_set=1 || true
+        fi
+    done
+    [ "$governor_set" -eq 1 ] && log "Set CPU governor to $target"
+}
+
+# ==================== Transparent Huge Pages ====================
+tune_thp() {
+    local thp_file="/sys/kernel/mm/transparent_hugepage/enabled"
+    [ -f "$thp_file" ] || return 0
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would set THP to $THP"
+        return 0
+    fi
+    echo "$THP" > "$thp_file" 2>/dev/null && \
+        log "Set THP to $THP" || warn "Failed to set THP"
+}
+
+# ==================== FSTRIM ====================
+enable_fstrim() {
+    [ "$HAS_SSD" -eq 0 ] && return 0
+
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would enable fstrim.timer for SSD maintenance"
+        return 0
+    fi
+
+    if systemctl list-unit-files 2>/dev/null | grep -q fstrim.timer; then
+        systemctl enable --now fstrim.timer 2>/dev/null && \
+            log "Enabled fstrim.timer for SSD maintenance" || true
+    fi
+}
+
+# ==================== Main Application ====================
+apply_all() {
+    [ "$DRY_RUN" = "1" ] && log "--- DRY RUN MODE: no changes will be made ---"
+
+    # If a config already exists, respect it — the user may have edited it.
+    # Only generate a fresh config when one doesn't exist yet.
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log "No config found — generating defaults from hardware detection"
+        generate_config
+    else
+        log "Using existing config: $CONFIG_FILE"
+        log "(Run 'kernel-autotune regen-config' to regenerate from hardware detection)"
+    fi
+
+    # Validate before sourcing — catches syntax errors and missing/invalid keys
+    validate_config
+
+    # Source once here; all sub-functions use the exported environment.
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+
+    # Fix #42: Track what has been applied so partial failures are visible in status.
+    local APPLIED=()
+    local FAILED_STEPS=()
+
+    _try_step() {
+        local step_name="$1"
+        shift
+        if "$@"; then
+            APPLIED+=("$step_name")
+        else
+            warn "Step '$step_name' failed"
+            FAILED_STEPS+=("$step_name")
+        fi
+    }
+
+    _try_step "sysctl"       apply_sysctl
+    _try_step "zram"         setup_zram
+    _try_step "zswap"        setup_zswap
+    _try_step "io_scheduler" tune_io_scheduler
+    _try_step "cpu_governor" tune_cpu_governor
+    _try_step "thp"          tune_thp
+    _try_step "fstrim"       enable_fstrim
+
+    # Fix #42: Append applied/failed step lists to the state file.
+    python3 - <<PYEOF
+import json, sys
+try:
+    with open("$STATE_FILE") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data["applied_steps"]  = """${APPLIED[*]:-}""".split()
+data["failed_steps"]   = "${FAILED_STEPS[*]:-}".split()
+data["apply_complete"] = len(data["failed_steps"]) == 0
+with open("$STATE_FILE", "w") as f:
+    json.dump(data, f, indent=2)
+PYEOF
+
+    if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+        warn "Apply completed with failures: ${FAILED_STEPS[*]}"
+    else
+        log "All optimizations applied successfully"
+    fi
+    # Fix #9: No subshell re-source needed; variables are in scope from source above.
+    log "Profile: $KERNEL on $DEVICE_TYPE with ${RAM_MB}MB RAM (v${SCRIPT_VERSION})"
+}
+
+# ==================== Config Regeneration ====================
+regen_config() {
+    need_root
+    if [ -f "$CONFIG_FILE" ]; then
+        local backup="${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp "$CONFIG_FILE" "$backup"
+        log "Existing config backed up to: $backup"
+    fi
+    generate_config
+    log "Config regenerated from hardware detection."
+    log "Previous config saved as backup (see above)."
+    log "Run 'kernel-autotune apply' to apply the new settings."
+}
+
+# ==================== Installation ====================
+install() {
+    need_root
+    log "Installing kernel autotune v${SCRIPT_VERSION}..."
+
+    mkdir -p "$WORKDIR"
+
+    # Fix #30: Use realpath to get the canonical script path; guard against
+    # being invoked as "bash kernel-autotune".
+    local SCRIPT_PATH
+    SCRIPT_PATH="$(realpath "$0" 2>/dev/null || true)"
+    if [ -z "$SCRIPT_PATH" ] || [ ! -f "$SCRIPT_PATH" ]; then
+        error "Cannot determine script path from \$0='$0'. Install by copying manually to /usr/local/bin/kernel-autotune."
+    fi
+
+    cp "$SCRIPT_PATH" /usr/local/bin/kernel-autotune
+    chmod +x /usr/local/bin/kernel-autotune
+
+    apply_all
+
+    # Fix #15: Single source of truth — write the service file from here,
+    # keeping it identical to the standalone kernel-autotune.service.
+    cat > /etc/systemd/system/kernel-autotune.service <<'EOF'
+[Unit]
+Description=Kernel Autotune v2.1.0
+After=local-fs.target sysinit.target swap.target
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kernel-autotune apply
+RemainAfterExit=yes
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable kernel-autotune.service
+
+    log "Installed successfully. Will run on every boot."
+    log "Configuration: $CONFIG_FILE"
+    log "State: $STATE_FILE"
+}
+
+# ==================== Uninstallation ====================
+uninstall() {
+    need_root
+    log "Uninstalling kernel autotune..."
+
+    systemctl disable --now kernel-autotune.service 2>/dev/null || true
+    rm -f /etc/systemd/system/kernel-autotune.service
+    rm -f /usr/local/bin/kernel-autotune
+    rm -rf "$WORKDIR"
+    rm -f "$SYSCTL_CONF"
+    rm -f "$ZRAM_SCRIPT"
+    # Fix #21: Also remove the log file on uninstall.
+    rm -f "$LOG_FILE"
+
+    systemctl daemon-reload
+
+    log "Uninstalled successfully"
+}
+
+# ==================== Status ====================
+show_status() {
+    # Fix #41: Inform non-root users explicitly if the log is unreadable.
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "Not configured. Run 'install' first."
+        exit 1
+    fi
+
+    echo "=== Kernel Autotune Status (v${SCRIPT_VERSION}) ==="
+
+    # Fix #49: Show reconciliation between configured state and live state.
+    if [ -f "$STATE_FILE" ]; then
+        echo "--- Configured State ---"
+        cat "$STATE_FILE"
+        echo
+
+        # Check if apply was complete
+        python3 -c "
+import json, sys
+try:
+    d = json.load(open('$STATE_FILE'))
+    ok = d.get('apply_complete', 'unknown')
+    failed = d.get('failed_steps', [])
+    print('Apply complete:', ok)
+    if failed:
+        print('Failed steps:', ', '.join(failed))
+except Exception as e:
+    print('Could not parse state file:', e)
+" 2>/dev/null || echo "(Could not parse state file)"
+    else
+        echo "State file not found"
+    fi
+
+    echo
+    echo "--- Live ZRAM Swap ---"
+    swapon --show=NAME,TYPE,SIZE,USED,PRIO 2>/dev/null | grep zram || echo "No ZRAM active"
+
+    echo
+    echo "--- Logs (last 20 lines) ---"
+    if [ -r "$LOG_FILE" ]; then
+        tail -n 20 "$LOG_FILE"
+    elif [ -f "$LOG_FILE" ]; then
+        echo "Log exists but is not readable by current user (try sudo)"
+    else
+        echo "No logs yet"
+    fi
+}
+
+# ==================== Main ====================
+# Parse global flags before the subcommand
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run|-n)
+            DRY_RUN=1
+            shift
+            ;;
+        --quiet|-q)
+            LOG_LEVEL=0
+            shift
+            ;;
+        --verbose|-v)
+            LOG_LEVEL=2
+            shift
+            ;;
+        --version|-V)
+            echo "kernel-autotune $SCRIPT_VERSION"
+            exit 0
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--dry-run] [--quiet|--verbose] {install|apply|regen-config|uninstall|status|--version}"
+            echo
+            echo "Commands:"
+            echo "  install      Install and enable on boot"
+            echo "  apply        Apply settings now (preserves config edits)"
+            echo "  regen-config Regenerate config from hardware detection (backs up existing)"
+            echo "  uninstall    Remove everything including logs"
+            echo "  status       Show current configuration and state"
+            echo
+            echo "Flags (can appear before the command):"
+            echo "  --dry-run    Print what would be done without making any changes"
+            echo "  --quiet      Suppress informational output (warnings/errors still shown)"
+            echo "  --verbose    Show per-device and per-step detail"
+            echo "  --version    Print version and exit"
+            echo "  --help       Show this help"
+            echo
+            echo "Config file: $CONFIG_FILE"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown flag: $1" >&2
+            echo "Run '$0 --help' for usage." >&2
+            exit 1
+            ;;
+        *)
+            COMMAND="$1"
+            shift
+            break
+            ;;
+    esac
+done
+
+[ "$DRY_RUN" = "1" ] && _write_log "Invoked with --dry-run"
+[ "$LOG_LEVEL" -eq 0 ] && _write_log "Invoked with --quiet"
+[ "$LOG_LEVEL" -eq 2 ] && _write_log "Invoked with --verbose"
+
+case "${COMMAND:-apply}" in
+    install)
+        acquire_lock
+        install
+        ;;
+    apply)
+        need_root
+        acquire_lock
+        apply_all
+        ;;
+    regen-config)
+        need_root
+        acquire_lock
+        regen_config
+        ;;
+    uninstall)
+        need_root
+        acquire_lock
+        uninstall
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Unknown command: $COMMAND" >&2
+        echo "Run '$0 --help' for usage." >&2
+        exit 1
+        ;;
+esac

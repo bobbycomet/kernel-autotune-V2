@@ -1,0 +1,18 @@
+[Unit]
+Description=Kernel Autotune v2.2.0
+# Fix #13: Add sysinit.target so modprobe has a working module filesystem
+# Fix #13: Add swap.target to avoid racing with fstab swap activation
+After=local-fs.target sysinit.target swap.target
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kernel-autotune apply
+RemainAfterExit=yes
+# Fix #14: Set a generous but finite timeout so a hung swapon cannot stall boot forever
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
