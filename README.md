@@ -2,7 +2,7 @@
   <img src="https://github.com/bobbycomet/kernel-autotune-V2/blob/main/kernelautotune.png?raw=true" width="50%">
 </p>
 
-# Kernel Autotune v2.2.0
+# Kernel Autotune v2.3.0
 
 TLDR: Makes your system more predictable by automatically tuning your Linux kernel, memory, CPU, storage, and networking, no manual tweaking required.
 
