@@ -173,3 +173,5 @@ Before applying, the script validates `config.sh` for syntax errors, missing req
 - **Partial-failure tracking**: Each tuning step (sysctl, zram, zswap, io_scheduler, cpu_governor, thp, fstrim) is tracked independently. Failures are reported in the `status` output without aborting the remaining steps.
 - **Fallback chains**: BBR falls back to cubic; z3fold zpool falls back to zbud; unsupported I/O schedulers are skipped per-device.
 - **Dry-run mode**: Fully safe, prints every action that would be taken without writing anything to disk or sysfs.
+
+Kernel Autotune is part of the Griffin Linux project. The name Kernel Autotune, the Griffin Linux name, and associated icons are protected under the GPLv3 to preserve the integrity of the branding in all distributed versions.
