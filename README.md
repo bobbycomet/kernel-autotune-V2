@@ -174,4 +174,16 @@ Before applying, the script validates `config.sh` for syntax errors, missing req
 - **Fallback chains**: BBR falls back to cubic; z3fold zpool falls back to zbud; unsupported I/O schedulers are skipped per-device.
 - **Dry-run mode**: Fully safe, prints every action that would be taken without writing anything to disk or sysfs.
 
+## Community and Support
+
+- **Discord:** [Join Here](https://discord.gg/7fEt5W7DPh)
+- **Patreon (Beta Builds):** [Patreon](https://www.patreon.com/c/BobbyComet/membership)
+- **Support the Griffin Project:** [Ko-fi](https://ko-fi.com/bobby60908)
+
+<div align="center">
+  <img src="https://raw.githubusercontent.com/bobbycomet/Appify/main/Griffin-G.png" alt="Griffin Linux" width="15%"/>
+  <p><strong>Griffin Linux. Where power meets simplicity.</strong><br/>
+  Made with Windows switchers in mind. Built for everyone who wants a better PC.</p>
+</div>
+
 Kernel Autotune is part of the Griffin Linux project. The name Kernel Autotune, the Griffin Linux name, and associated icons are protected under the GPLv3 to preserve the integrity of the branding in all distributed versions.
