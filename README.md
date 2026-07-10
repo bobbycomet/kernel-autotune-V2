@@ -174,6 +174,16 @@ Before applying, the script validates `config.sh` for syntax errors, missing req
 - **Fallback chains**: BBR falls back to cubic; z3fold zpool falls back to zbud; unsupported I/O schedulers are skipped per-device.
 - **Dry-run mode**: Fully safe, prints every action that would be taken without writing anything to disk or sysfs.
 
+Kernel Autotune is licensed under the GPLv3, and forks and derivative projects are welcome.
+
+If you build on Kernel Autotune, please:
+
+- Keep the GPLv3 license terms intact.
+- Give appropriate credit to the original Kernel Autotune project.
+- Include a link back to this repository where practical.
+
+If you're building something cool with it, I'd love to hear about it!
+
 ## Community and Support
 
 - **Discord:** [Join Here](https://discord.gg/7fEt5W7DPh)
@@ -186,4 +196,6 @@ Before applying, the script validates `config.sh` for syntax errors, missing req
   Made with Windows switchers in mind. Built for everyone who wants a better PC.</p>
 </div>
 
-Kernel Autotune is part of the Griffin Linux project. The name Kernel Autotune, the Griffin Linux name, and associated icons are protected under the GPLv3 to preserve the integrity of the branding in all distributed versions.
+The Kernel Autotune and Griffin Linux names, logos, and branding are not covered by the GPL license and may not be used to imply endorsement 
+or official affiliation without permission. Forks are encouraged, but please rename and rebrand modified versions unless you've 
+received permission to use the original branding.
