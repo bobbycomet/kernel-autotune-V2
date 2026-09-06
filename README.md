@@ -6,6 +6,8 @@
 
 TLDR: Makes your system more predictable by automatically tuning your Linux kernel, memory, CPU, storage, and networking, no manual tweaking required.
 
+[Check the WIKI for more technical info](https://github.com/bobbycomet/kernel-autotune-V2/wiki)
+
 An intelligent Linux kernel tuning utility that detects your hardware and running kernel, then applies a tailored performance profile automatically. Designed for Ubuntu users coming from Windows who want better system performance without digging through forums or terminals. Best paired with: [Process Sentry](https://github.com/bobbycomet/Process-Sentry), automatic background process control and cleanup.
 
 ## What it changes
