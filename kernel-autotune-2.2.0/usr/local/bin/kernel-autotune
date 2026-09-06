@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# kernel-autotune v2.2.0
+# kernel-autotune v2.3.0
 # Intelligent kernel tuning with predictable behavior and safety.
 #
 # Usage: kernel-autotune [--dry-run] [--quiet|--verbose] {install|apply|regen-config|uninstall|status|--version}
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -169,6 +169,87 @@ get_net_qdisc() {
     fi
 }
 
+# ==================== System Info (Identification) ====================
+# These are descriptive/informational only — none of them feed tuning
+# decisions. They exist purely so state.json carries enough context to
+# identify the machine and diagnose issues without SSH-ing in.
+
+get_hostname() {
+    hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown"
+}
+
+get_kernel_version() {
+    uname -r 2>/dev/null || echo "unknown"
+}
+
+# Best-effort distro pretty name. /etc/os-release is the standard on every
+# systemd distro; fall back to lsb_release, then uname, then "unknown"
+# rather than letting set -e kill the whole run over a missing file.
+get_distro() {
+    local distro=""
+    if [ -r /etc/os-release ]; then
+        distro="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-}")"
+    fi
+    if [ -z "$distro" ] && command -v lsb_release >/dev/null 2>&1; then
+        distro="$(lsb_release -ds 2>/dev/null | tr -d '"')"
+    fi
+    [ -z "$distro" ] && distro="$(uname -s) $(uname -r)"
+    echo "$distro"
+}
+
+# /proc/cpuinfo's "model name" is absent on some architectures (e.g. some
+# ARM boards use "Hardware"/"Model" instead) — try a couple of fallbacks
+# before giving up.
+get_cpu_model() {
+    local model=""
+    model="$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+    if [ -z "$model" ]; then
+        model="$(awk -F': ' '/^Model/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+    fi
+    [ -z "$model" ] && model="unknown"
+    echo "$model"
+}
+
+# GPU model detection, preferring vendor tools (which give the cleanest
+# name) and falling back to lspci, then to "unknown" if neither is present.
+# Handles multi-GPU systems by joining all matches with "; ".
+get_gpu_model() {
+    local models=""
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        models="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd '; ' -)"
+    fi
+
+    if [ -z "$models" ] && command -v lspci >/dev/null 2>&1; then
+        # Match VGA/3D/display controllers, strip the leading "VGA compatible
+        # controller: " style prefix lspci adds so we keep just the model.
+        models="$(lspci 2>/dev/null | grep -Ei 'vga|3d controller|display controller' \
+            | sed -E 's/^[0-9a-f:.]+ [^:]+: //' | paste -sd '; ' -)"
+    fi
+
+    [ -z "$models" ] && models="unknown"
+    echo "$models"
+}
+
+# GPU driver/version detection. NVIDIA proprietary driver version comes from
+# nvidia-smi; for everything else (Mesa/AMD/Intel open-source stack) report
+# the Mesa/OpenGL version via glxinfo if available, since there's no single
+# "driver version" file that works across vendors.
+get_gpu_driver() {
+    local driver=""
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
+    fi
+
+    if [ -z "$driver" ] && command -v glxinfo >/dev/null 2>&1; then
+        driver="$(glxinfo 2>/dev/null | awk -F': ' '/^OpenGL version string/ {print $2; exit}')"
+    fi
+
+    [ -z "$driver" ] && driver="unknown"
+    echo "$driver"
+}
+
 # ==================== Configuration Generation ====================
 generate_config() {
     mkdir -p "$WORKDIR"
@@ -188,6 +269,15 @@ generate_config() {
     local HAS_THERMAL
     HAS_THERMAL=$(has_thermal_control && echo 1 || echo 0)
 
+    # Identification/info fields — descriptive only, never feed tuning logic.
+    local HOSTNAME_VAL DISTRO_VAL KERNEL_VERSION_VAL CPU_MODEL_VAL GPU_MODEL_VAL GPU_DRIVER_VAL
+    HOSTNAME_VAL=$(get_hostname)
+    DISTRO_VAL=$(get_distro)
+    KERNEL_VERSION_VAL=$(get_kernel_version)
+    CPU_MODEL_VAL=$(get_cpu_model)
+    GPU_MODEL_VAL=$(get_gpu_model)
+    GPU_DRIVER_VAL=$(get_gpu_driver)
+
     # Determine device type
     if is_handheld; then
         DEVICE_TYPE="handheld"
@@ -197,6 +287,9 @@ generate_config() {
 
     log "Detected: $KERNEL kernel, $DEVICE_TYPE, ${RAM_MB}MB RAM, $CPU_CORES cores," \
         "SSD=$HAS_SSD, NUMA=$IS_NUMA, THERMAL=$HAS_THERMAL"
+    verbose "Host: $HOSTNAME_VAL | Distro: $DISTRO_VAL | Kernel version: $KERNEL_VERSION_VAL"
+    verbose "CPU: $CPU_MODEL_VAL"
+    verbose "GPU: $GPU_MODEL_VAL (driver: $GPU_DRIVER_VAL)"
 
     # ==================== Base Defaults ====================
     SWAPPINESS=15
@@ -330,6 +423,22 @@ generate_config() {
         # Allow only alphanumerics, hyphen, underscore, dot, plus.
         echo "$1" | tr -cd 'a-zA-Z0-9_.+-'
     }
+    # Descriptive free-text fields (hostname, distro, CPU/GPU model strings)
+    # legitimately contain spaces, commas, parens, colons — e.g.
+    # "AMD Ryzen 7 2700 Eight-Core Processor" or "NVIDIA RTX 2060, REV. A".
+    # Strip only characters that would break the shell-sourced config file
+    # (backticks, $, double-quotes, backslash, single-quotes, newlines)
+    # while keeping the rest, including digits.
+    # NOTE: a literal single-quote can't be written directly inside a
+    # single-quoted tr argument, and '\x27' is NOT an escape tr understands
+    # (tr reads it as the literal characters \,x,2,7 — which silently
+    # deletes every '2' and '7' in the input, e.g. turning "24.04" into
+    # "4.04"). Build the single-quote via printf's octal escape instead.
+    local _SQ
+    _SQ="$(printf '\47')"
+    _sanitize_text() {
+        echo "$1" | tr -d "\`\$\\\\\"${_SQ}" | tr '\n\r' '  ' | sed -e 's/[[:space:]]*$//' | head -c 256
+    }
     KERNEL=$(_sanitize "$KERNEL")
     DEVICE_TYPE=$(_sanitize "$DEVICE_TYPE")
     ZRAM_ALGO=$(_sanitize "$ZRAM_ALGO")
@@ -339,6 +448,12 @@ generate_config() {
     NET_QDISC=$(_sanitize "$NET_QDISC")
     IO_SCHEDULER_SSD=$(_sanitize "$IO_SCHEDULER_SSD")
     IO_SCHEDULER_HDD=$(_sanitize "$IO_SCHEDULER_HDD")
+    HOSTNAME_VAL=$(_sanitize_text "$HOSTNAME_VAL")
+    DISTRO_VAL=$(_sanitize_text "$DISTRO_VAL")
+    KERNEL_VERSION_VAL=$(_sanitize_text "$KERNEL_VERSION_VAL")
+    CPU_MODEL_VAL=$(_sanitize_text "$CPU_MODEL_VAL")
+    GPU_MODEL_VAL=$(_sanitize_text "$GPU_MODEL_VAL")
+    GPU_DRIVER_VAL=$(_sanitize_text "$GPU_DRIVER_VAL")
 
     cat > "$CONFIG_FILE" <<EOF
 # kernel-autotune configuration — generated from hardware detection.
@@ -389,17 +504,42 @@ CPU_CORES=$CPU_CORES
 HAS_SSD=$HAS_SSD
 IS_NUMA=$IS_NUMA
 HAS_THERMAL=$HAS_THERMAL
+
+# System identification (informational only — never feeds tuning decisions)
+HOSTNAME_VAL="$HOSTNAME_VAL"
+DISTRO_VAL="$DISTRO_VAL"
+KERNEL_VERSION_VAL="$KERNEL_VERSION_VAL"
+CPU_MODEL_VAL="$CPU_MODEL_VAL"
+GPU_MODEL_VAL="$GPU_MODEL_VAL"
+GPU_DRIVER_VAL="$GPU_DRIVER_VAL"
 EOF
 
     # Fix #29: Use printf for JSON to avoid injection from shell variable content.
+    # The new identification fields are free text (may contain spaces, commas,
+    # parens, etc.) so they're passed via the environment and read with
+    # os.environ rather than interpolated into the Python source string —
+    # interpolating them directly risks breaking out of the quoted literal.
+    KAT_HOSTNAME="$HOSTNAME_VAL" \
+    KAT_DISTRO="$DISTRO_VAL" \
+    KAT_KERNEL_VERSION="$KERNEL_VERSION_VAL" \
+    KAT_CPU_MODEL="$CPU_MODEL_VAL" \
+    KAT_GPU_MODEL="$GPU_MODEL_VAL" \
+    KAT_GPU_DRIVER="$GPU_DRIVER_VAL" \
     python3 -c "
-import json, sys
+import json, os
+
 data = {
     'script_version': '$SCRIPT_VERSION',
+    'hostname': os.environ.get('KAT_HOSTNAME', 'unknown'),
+    'distro': os.environ.get('KAT_DISTRO', 'unknown'),
     'last_updated': '$(date -Iseconds)',
     'kernel': '$KERNEL',
+    'kernel_version': os.environ.get('KAT_KERNEL_VERSION', 'unknown'),
     'device_type': '$DEVICE_TYPE',
+    'gpu_model': os.environ.get('KAT_GPU_MODEL', 'unknown'),
+    'gpu_driver': os.environ.get('KAT_GPU_DRIVER', 'unknown'),
     'ram_mb': $RAM_MB,
+    'cpu_model': os.environ.get('KAT_CPU_MODEL', 'unknown'),
     'cpu_cores': $CPU_CORES,
     'has_ssd': $HAS_SSD,
     'is_numa': $IS_NUMA,
@@ -417,7 +557,8 @@ data = {
         'zswap_enabled': $ZSWAP_ENABLED,
         'tcp_congestion': '$TCP_CONGESTION',
         'net_qdisc': '$NET_QDISC',
-    }
+    },
+    'last_apply_duration': None,
 }
 print(json.dumps(data, indent=2))
 " > "$STATE_FILE"
@@ -454,6 +595,8 @@ Run 'kernel-autotune regen-config' to reset it, or fix the error manually."
     )
     local detectable_keys=(
         KERNEL DEVICE_TYPE RAM_MB CPU_CORES HAS_SSD IS_NUMA HAS_THERMAL
+        HOSTNAME_VAL DISTRO_VAL KERNEL_VERSION_VAL CPU_MODEL_VAL GPU_MODEL_VAL GPU_DRIVER_VAL
+        DIRTY_WRITEBACK_CS DIRTY_EXPIRE_CS
     )
 
     # Check for missing keys by sourcing into a subshell
@@ -484,11 +627,22 @@ Edit $CONFIG_FILE to add them, or run 'kernel-autotune regen-config' to reset."
 
         # Build the migration block as a variable first, so no stray output
         # (log calls, subshell noise) ends up inside the config file.
+        #
+        # IMPORTANT: command substitution $(...) always strips trailing
+        # newlines. Concatenating multiple "migration_lines+=\"\$(printf
+        # '...\n')\"" calls therefore silently drops the newline between
+        # each entry, collapsing the entire appended block onto one
+        # physical line — which then becomes one giant shell comment, so
+        # NONE of the migrated variables actually get set when the config
+        # is later sourced (this was a real, previously-latent bug). Fix:
+        # explicitly append a literal newline ($'\n') after each captured
+        # value rather than relying on the substitution to carry it.
         local migration_lines
-        migration_lines="$(printf '\n# Auto-migrated by kernel-autotune v%s on %s\n' "$SCRIPT_VERSION" "$(date)")"
+        migration_lines="$(printf '# Auto-migrated by kernel-autotune v%s on %s' "$SCRIPT_VERSION" "$(date)")"
+        migration_lines+=$'\n'
 
         for key in "${missing_detectable[@]}"; do
-            local val=""
+            local val="" quoted=0
             case "$key" in
                 KERNEL)      val=$(detect_kernel) ;;
                 DEVICE_TYPE)
@@ -500,15 +654,64 @@ Edit $CONFIG_FILE to add them, or run 'kernel-autotune regen-config' to reset."
                 HAS_SSD)     val=$(has_ssd) ;;
                 IS_NUMA)     val=$(is_numa_system && echo 1 || echo 0) ;;
                 HAS_THERMAL) val=$(has_thermal_control && echo 1 || echo 0) ;;
+                HOSTNAME_VAL)       val=$(get_hostname);       quoted=1 ;;
+                DISTRO_VAL)         val=$(get_distro);         quoted=1 ;;
+                KERNEL_VERSION_VAL) val=$(get_kernel_version); quoted=1 ;;
+                CPU_MODEL_VAL)      val=$(get_cpu_model);      quoted=1 ;;
+                GPU_MODEL_VAL)      val=$(get_gpu_model);      quoted=1 ;;
+                GPU_DRIVER_VAL)     val=$(get_gpu_driver);     quoted=1 ;;
+                DIRTY_WRITEBACK_CS|DIRTY_EXPIRE_CS)
+                    # Both are derived from DIRTY_RATIO using the same
+                    # formula generate_config uses. Computed independently
+                    # from DIRTY_RATIO here (not chained off each other's
+                    # loop-local $val) since migration order within
+                    # missing_detectable isn't guaranteed to have already
+                    # written DIRTY_WRITEBACK_CS into scope before
+                    # DIRTY_EXPIRE_CS is processed.
+                    if [ -z "${DIRTY_RATIO:-}" ]; then
+                        # required_keys validation runs after this
+                        # migration step, so if DIRTY_RATIO itself is also
+                        # missing, fall back to the same default
+                        # generate_config would pick for a typical desktop.
+                        _write_log "WARNING: DIRTY_RATIO missing while migrating $key; using fallback DIRTY_RATIO=20 for the calculation"
+                        local _dr=20
+                    else
+                        local _dr="$DIRTY_RATIO"
+                    fi
+                    local _wcs=$(( 500 + _dr * 50 ))
+                    if [ "$key" = "DIRTY_WRITEBACK_CS" ]; then
+                        val="$_wcs"
+                    else
+                        val=$(( _wcs * 2 ))
+                    fi
+                    ;;
                 *)           val="0" ;;
             esac
-            migration_lines+="$(printf '%s=%s\n' "$key" "$val")"
+            # Free-text fields contain spaces/punctuation and must be quoted
+            # when written back into the shell-sourced config file. Use the
+            # same digit-safe sanitization as _sanitize_text in generate_config
+            # (see the comment there about the \x27-in-tr pitfall).
+            if [ "$quoted" -eq 1 ]; then
+                local _sq
+                _sq="$(printf '\47')"
+                val="$(echo "$val" | tr -d "\`\$\\\\\"${_sq}" | tr '\n\r' '  ' | sed -e 's/[[:space:]]*$//' | head -c 256)"
+                migration_lines+="$(printf '%s="%s"' "$key" "$val")"
+            else
+                migration_lines+="$(printf '%s=%s' "$key" "$val")"
+            fi
+            migration_lines+=$'\n'
             # Log to file only (not stdout) so it doesn't pollute the config
             _write_log "Migrated: ${key}=${val}"
         done
 
-        # Append only the clean key=value lines to the config file
-        printf '%s\n' "$migration_lines" >> "$CONFIG_FILE"
+        # Append the clean key=value lines to the config file. Each line
+        # already ends in a real newline (added above), and migration_lines
+        # itself begins with the "# Auto-migrated..." comment line, so this
+        # produces one well-formed block — printf '%s\n' would add an extra
+        # blank line at the end, which is harmless but unnecessary; use a
+        # plain leading blank line instead for visual separation from the
+        # preceding config content.
+        printf '\n%s' "$migration_lines" >> "$CONFIG_FILE"
 
         log "Config migration complete. Keys appended to $CONFIG_FILE."
     fi
@@ -657,8 +860,15 @@ setup_zram() {
     fi
 
     # ---- Write the zram script with parameters baked in, then execute it ----
-    # The standalone kernel-autotune-zram.sh is the canonical implementation.
-    # We set env vars and invoke it rather than embedding duplicate logic here.
+    # The canonical implementation lives at a SEPARATE path from $ZRAM_SCRIPT
+    # on purpose. $ZRAM_SCRIPT ($WORKDIR-adjacent, /usr/local/bin/kernel-
+    # autotune-zram.sh) is regenerated by the `cat >` below on every apply —
+    # it used to BE the canonical file's path, which meant this cat
+    # truncated the canonical implementation out from under itself before
+    # the splice check a few lines down ever ran, silently degrading every
+    # apply to the direct-invocation fallback. The canonical implementation
+    # now lives at CANONICAL_ZRAM_IMPL, a distinct, never-overwritten path.
+    local CANONICAL_ZRAM_IMPL="/usr/local/lib/kernel-autotune/zram-impl.sh"
     cat > "$ZRAM_SCRIPT" <<EOF
 #!/usr/bin/env bash
 # Generated by kernel-autotune v${SCRIPT_VERSION} on $(date)
@@ -669,17 +879,32 @@ export ZRAM_ALGO="$ZRAM_ALGO"
 export ZRAM_STRICT=0
 export ZRAM_DRY_RUN=0
 EOF
-    # Append canonical implementation from the installed standalone script
-    tail -n +16 /usr/local/bin/kernel-autotune-zram.sh >> "$ZRAM_SCRIPT" 2>/dev/null || {
-        # Standalone script not installed yet (first-time install path) —
-        # fall back to direct invocation with env vars
+    # Append canonical implementation from the installed standalone script.
+    # Splice on the marker line rather than a hardcoded line offset, so
+    # editing the canonical file's header/docs can never silently break
+    # this append (a fixed `tail -n +N` would go stale the moment anyone
+    # added or removed a comment line above the real logic).
+    if [ -f "$CANONICAL_ZRAM_IMPL" ] && \
+       grep -q '^# kernel-autotune-zram.sh:BEGIN-IMPLEMENTATION$' "$CANONICAL_ZRAM_IMPL" 2>/dev/null; then
+        sed -n '/^# kernel-autotune-zram.sh:BEGIN-IMPLEMENTATION$/,$p' \
+            "$CANONICAL_ZRAM_IMPL" | tail -n +2 >> "$ZRAM_SCRIPT"
+    else
+        # Canonical implementation not installed (e.g. running kernel-autotune
+        # directly without the .deb, or an install predating this file) —
+        # fall back to direct invocation if it happens to exist at the old
+        # location, otherwise report clearly and skip zram for this run.
         rm -f "$ZRAM_SCRIPT"
-        NUM_DEVICES=$NUM_DEVICES ZRAM_SIZE_MB=$ZRAM_SIZE_MB \
-            ZRAM_ALGO=$ZRAM_ALGO ZRAM_STRICT=0 \
-            /usr/local/bin/kernel-autotune-zram.sh 2>&1 | tee -a "$LOG_FILE"
-        log "ZRAM configured via direct invocation"
+        if [ -x "$CANONICAL_ZRAM_IMPL" ]; then
+            NUM_DEVICES=$NUM_DEVICES ZRAM_SIZE_MB=$ZRAM_SIZE_MB \
+                ZRAM_ALGO=$ZRAM_ALGO ZRAM_STRICT=0 \
+                "$CANONICAL_ZRAM_IMPL" 2>&1 | tee -a "$LOG_FILE"
+            log "ZRAM configured via direct invocation"
+        else
+            warn "ZRAM implementation not found at $CANONICAL_ZRAM_IMPL — skipping ZRAM setup"
+            warn "(reinstall the kernel-autotune package, or restore this file manually)"
+        fi
         return 0
-    }
+    fi
 
     chmod +x "$ZRAM_SCRIPT"
 
@@ -826,6 +1051,16 @@ enable_fstrim() {
 apply_all() {
     [ "$DRY_RUN" = "1" ] && log "--- DRY RUN MODE: no changes will be made ---"
 
+    # Track wall-clock duration of the apply run for state.json's
+    # last_apply_duration field. date +%s.%N gives sub-second resolution on
+    # GNU coreutils; on systems where %N isn't supported it just prints
+    # literal "N", so fall back to whole-second resolution in that case.
+    local APPLY_START
+    APPLY_START="$(date +%s.%N 2>/dev/null)"
+    case "$APPLY_START" in
+        *N|*[!0-9.]*) APPLY_START="$(date +%s)" ;;
+    esac
+
     # If a config already exists, respect it — the user may have edited it.
     # Only generate a fresh config when one doesn't exist yet.
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -867,8 +1102,41 @@ apply_all() {
     _try_step "fstrim"       enable_fstrim
 
     # Fix #42: Append applied/failed step lists to the state file.
-    python3 - <<PYEOF
-import json, sys
+    # NOTE: the state.json WRITE is skipped entirely in --dry-run, since
+    # dry-run must never mutate persistent state. Previously (pre-this-edit)
+    # this block ran unconditionally even in dry-run, which meant a
+    # --dry-run invocation would silently overwrite the real
+    # applied_steps/failed_steps/apply_complete fields in the live
+    # state.json with dry-run's (mostly no-op) results. That looked like a
+    # pre-existing bug, so it's fixed here rather than carried forward —
+    # flagging it in case the old behavior was relied upon somewhere.
+    local APPLY_END APPLY_DURATION
+    APPLY_END="$(date +%s.%N 2>/dev/null)"
+    case "$APPLY_END" in
+        *N|*[!0-9.]*) APPLY_END="$(date +%s)" ;;
+    esac
+    # Use awk for the subtraction so this works whether we got sub-second
+    # ("%s.%N") or whole-second timestamps, and round to 1 decimal place.
+    APPLY_DURATION="$(awk -v a="$APPLY_START" -v b="$APPLY_END" 'BEGIN { printf "%.1f", (b - a) }' 2>/dev/null || echo "0")"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        dry_run_notice "Would update $STATE_FILE (applied_steps, failed_steps, last_apply_duration)"
+    else
+        # The identification fields (HOSTNAME_VAL, DISTRO_VAL, etc.) are
+        # already in scope here from sourcing $CONFIG_FILE above — whether
+        # they came from a fresh generate_config or were backfilled by
+        # validate_config's migration. Refresh them into state.json on
+        # every apply (not just at config-generation time) so an existing
+        # install that never re-runs regen-config still gets them written.
+        KAT_HOSTNAME="${HOSTNAME_VAL:-unknown}" \
+        KAT_DISTRO="${DISTRO_VAL:-unknown}" \
+        KAT_KERNEL_VERSION="${KERNEL_VERSION_VAL:-unknown}" \
+        KAT_CPU_MODEL="${CPU_MODEL_VAL:-unknown}" \
+        KAT_GPU_MODEL="${GPU_MODEL_VAL:-unknown}" \
+        KAT_GPU_DRIVER="${GPU_DRIVER_VAL:-unknown}" \
+        python3 - <<PYEOF
+import json, os
+
 try:
     with open("$STATE_FILE") as f:
         data = json.load(f)
@@ -877,9 +1145,19 @@ except Exception:
 data["applied_steps"]  = """${APPLIED[*]:-}""".split()
 data["failed_steps"]   = "${FAILED_STEPS[*]:-}".split()
 data["apply_complete"] = len(data["failed_steps"]) == 0
+data["last_apply_duration"] = float("$APPLY_DURATION")
+data["last_updated"] = "$(date -Iseconds)"
+data["script_version"] = "$SCRIPT_VERSION"
+data["hostname"] = os.environ.get("KAT_HOSTNAME", "unknown")
+data["distro"] = os.environ.get("KAT_DISTRO", "unknown")
+data["kernel_version"] = os.environ.get("KAT_KERNEL_VERSION", "unknown")
+data["cpu_model"] = os.environ.get("KAT_CPU_MODEL", "unknown")
+data["gpu_model"] = os.environ.get("KAT_GPU_MODEL", "unknown")
+data["gpu_driver"] = os.environ.get("KAT_GPU_DRIVER", "unknown")
 with open("$STATE_FILE", "w") as f:
     json.dump(data, f, indent=2)
 PYEOF
+    fi
 
     if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
         warn "Apply completed with failures: ${FAILED_STEPS[*]}"
@@ -888,6 +1166,7 @@ PYEOF
     fi
     # Fix #9: No subshell re-source needed; variables are in scope from source above.
     log "Profile: $KERNEL on $DEVICE_TYPE with ${RAM_MB}MB RAM (v${SCRIPT_VERSION})"
+    log "Apply completed in ${APPLY_DURATION}s"
 }
 
 # ==================== Config Regeneration ====================
@@ -926,9 +1205,9 @@ install() {
 
     # Fix #15: Single source of truth — write the service file from here,
     # keeping it identical to the standalone kernel-autotune.service.
-    cat > /etc/systemd/system/kernel-autotune.service <<'EOF'
+    cat > /etc/systemd/system/kernel-autotune.service <<EOF
 [Unit]
-Description=Kernel Autotune v2.1.0
+Description=Kernel Autotune v${SCRIPT_VERSION}
 After=local-fs.target sysinit.target swap.target
 Before=systemd-user-sessions.service
 
