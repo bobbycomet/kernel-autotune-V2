@@ -1,5 +1,5 @@
 Package: kernel-autotune
-Version: 2.3.0
+Version: 2.4.0
 Section: utils
 Priority: optional
 Architecture: all
@@ -7,6 +7,6 @@ Maintainer: Bobby Comet
 Depends: bash, procps, coreutils, util-linux
 Description: Intelligent kernel tuning with predictable behavior and safety.
  Includes automated SSD detection, NUMA handling, and ZRAM/ZSWAP
- coordination. Version 2.3.0 introduces exclusive execution locking,
- a dry-run mode for safe testing, and enhanced hardware probing for
- handhelds and laptops.
+ coordination. Version 2.4.0 adds distro, init-system, kernel memory,
+ cgroup, PSI, container, ZRAM manager, and power-manager detection,
+ plus safer external ZRAM and CPU tuning policies.

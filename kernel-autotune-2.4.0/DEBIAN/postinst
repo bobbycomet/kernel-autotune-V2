@@ -7,7 +7,7 @@ systemctl daemon-reload
 # Make sure it stays enabled
 systemctl enable kernel-autotune.service
 
-# FORCE the new 2.2.0 logic to run right now
+# Apply the new 2.4.0 logic immediately
 systemctl restart kernel-autotune.service
 
 exit 0

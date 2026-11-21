@@ -2,7 +2,7 @@
   <img src="https://github.com/bobbycomet/kernel-autotune-V2/blob/main/kernelautotune.png?raw=true" width="50%">
 </p>
 
-# Kernel Autotune v2.3.0
+# Kernel Autotune v2.4.0
 
 TLDR: Makes your system more predictable by automatically tuning your Linux kernel, memory, CPU, storage, and networking, no manual tweaking required.
 
@@ -92,8 +92,8 @@ This copies the script to `/usr/local/bin/kernel-autotune`, runs hardware detect
 If you prefer the `.deb` package, use your package installer (recommended) or use sudo:
 
 ```
-wget https://github.com/bobbycomet/kernel-autotune-V2/releases/download/v2.2.0/kernel-autotune-2.2.0.deb
-sudo apt install ./kernel-autotune-2.2.0.deb
+wget https://github.com/bobbycomet/kernel-autotune-V2/releases/download/v2.4.0/kernel-autotune_2.4.0.deb
+sudo apt install ./kernel-autotune_2.4.0.deb
 ```
 
 ## ZRAM Note (Important)
